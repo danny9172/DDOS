@@ -1,6 +1,6 @@
 #!/bin/bash
 # DDoS Check Script - Optimized Single-Pass Analysis
-# Version: 2.0
+# Version: 2.1
 
 set -euo pipefail
 
@@ -8,14 +8,15 @@ set -euo pipefail
 # CONFIGURATION
 # ============================================
 SCRIPT_NAME=$(basename "$0")
-VERSION="2.0"
+VERSION="2.1"
 TMP_DIR=""
 LOG_FILE=""
 LOG_FORMAT=""
 LOG_TZ="UTC"
 USER_TZ="IST"
 USER_OFFSET="+0530"
-TOP_COUNT=20  # Changed from 30 to 20
+TOP_COUNT=20
+EXCLUDE_403=false  # Default: include 403
 
 # Colors for output
 RED='\033[0;31m'
@@ -51,19 +52,16 @@ prompt() {
 detect_log_format() {
     local first_line=$(head -1 "$LOG_FILE" 2>/dev/null)
     
-    # Check for Common Log Format: IP - - [timestamp] "method path proto" status size
     if [[ "$first_line" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+.*\[.*\].*\"[A-Z]+\ .+\ HTTP/[0-9]+\".* ]]; then
         echo "apache"
         return
     fi
     
-    # Check for Nginx format (similar but may have $http_x_forwarded_for)
     if [[ "$first_line" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+.*\[.*\].*\"[A-Z]+\ .+\ HTTP/[0-9]+\".*\"-\"\ *\" ]]; then
         echo "nginx"
         return
     fi
     
-    # Check for combined format
     if [[ "$first_line" =~ .*\"-\"\ *\".* ]]; then
         echo "combined"
         return
@@ -76,39 +74,41 @@ detect_log_timezone() {
     local first_ts=$(head -1 "$LOG_FILE" | awk -F'[][]' '{print $2}' 2>/dev/null)
     [[ -z "$first_ts" ]] && echo "UTC" && return
     
-    # Check if timestamp contains timezone offset
     if [[ "$first_ts" =~ .*[+-][0-9]{4}$ ]]; then
         echo "UTC"
     elif [[ "$first_ts" =~ .*IST$ ]]; then
         echo "IST"
     else
-        # Default to UTC for Nginx/Apache standard logs
         echo "UTC"
     fi
 }
 
 # ============================================
-# TIME HANDLING - SMART IST CONVERSION
+# TIME HANDLING - FIXED IST CONVERSION
 # ============================================
-convert_to_log_tz() {
-    local user_time="$1"
-    local log_tz="$2"
-    
-    if [[ "$log_tz" == "UTC" ]]; then
-        date -d "$user_time UTC" +"[%d/%b/%Y:%H:%M:%S" 2>/dev/null
-    elif [[ "$log_tz" == "IST" ]]; then
-        date -d "$user_time" +"[%d/%b/%Y:%H:%M:%S" 2>/dev/null
-    else
-        # Convert from IST to UTC if log is UTC
-        date -d "$user_time IST" +"[%d/%b/%Y:%H:%M:%S" 2>/dev/null
-    fi
+convert_log_to_ist() {
+    local log_time="$1"
+    # Convert from "28/Jun/2026:00:00:07 +0000" to "2026-06-28 00:00:07"
+    local formatted=$(echo "$log_time" | sed 's|/| |g' | sed 's|:| |' | awk '{print $3"-"$2"-"$1" "$4}')
+    # Convert month name to number
+    local month_map='Jan=01 Feb=02 Mar=03 Apr=04 May=05 Jun=06 Jul=07 Aug=08 Sep=09 Oct=10 Nov=11 Dec=12'
+    for m in $month_map; do
+        local mon=${m%=*}
+        local num=${m#*=}
+        formatted=$(echo "$formatted" | sed "s/$mon/$num/")
+    done
+    # Add timezone offset if present
+    local tz_offset=$(echo "$log_time" | grep -o '[+-][0-9]\{4\}' || echo "+0000")
+    TZ=Asia/Kolkata date -d "$formatted $tz_offset" "+%Y-%m-%d %H:%M:%S %Z" 2>/dev/null || echo "N/A"
 }
 
+# ============================================
+# TIME RANGE FUNCTIONS
+# ============================================
 get_time_range() {
     local choice="$1"
     local start_time=""
     local end_time=""
-    local now=$(date +"%Y-%m-%d %H:%M:%S")
     
     case "$choice" in
         1)  # Last 60 min
@@ -140,15 +140,22 @@ get_time_range() {
 }
 
 # ============================================
-# SINGLE-PASS PARSING - OPTIMIZED
+# SINGLE-PASS PARSING - WITH 403 EXCLUDE OPTION
 # ============================================
 parse_logs() {
     local start_time="$1"
     local end_time="$2"
     local parse_file="$3"
+    local exclude_403="${4:-false}"
+    
+    # Build status filter
+    local status_filter=""
+    if [[ "$exclude_403" == "true" ]]; then
+        status_filter="&& status != 403"
+    fi
     
     # Single awk pass - extracts ALL data at once
-    awk -v start="$start_time" -v end="$end_time" '
+    awk -v start="$start_time" -v end="$end_time" -v exclude="$exclude_403" '
     BEGIN {
         # Initialize arrays
         split("", ip_count)
@@ -157,16 +164,17 @@ parse_logs() {
         split("", query_count)
         split("", status_count)
         split("", hourly_ok)
-        split("", ip_status)
+        split("", hourly_range)  # Store first and last request per hour
         
         total_requests = 0
         total_ok = 0
         total_errors = 0
+        hour_counter = 0
     }
     
     # Parse Apache/Nginx combined format
     {
-        # Extract timestamp (assuming [dd/MMM/yyyy:HH:MM:SS] format)
+        # Extract timestamp
         ts = ""
         if (match($0, /\[[^]]+\]/)) {
             ts = substr($0, RSTART, RLENGTH)
@@ -174,44 +182,57 @@ parse_logs() {
         
         # Only process if within time range
         if (ts >= start && ts <= end) {
-            total_requests++
-            
-            # Extract IP (field 1)
-            ip = $1
-            
             # Extract status code
             status = $9
+            
+            # Skip 403 if excluded
+            if (exclude == "true" && status == 403) {
+                next
+            }
+            
+            total_requests++
             status_count[status]++
             
             if (status == 200 || status == 304) {
                 total_ok++
+                
+                # Extract IP
+                ip = $1
                 ip_count[ip]++
                 
-                # Extract URL (field 7)
+                # Extract URL
                 url = $7
                 url_count[url]++
                 
-                # Extract query string - FULL LINE
+                # Extract query string
                 query = url
                 if (match(url, /\?/)) {
                     query = substr(url, RSTART + 1)
-                    # Keep the full query string without truncation
                     query_count[query]++
                 } else {
                     query = "(no query)"
                 }
                 
-                # Extract hour for hourly stats
+                # Extract hour for hourly stats - FIXED
                 hour = ""
                 if (match(ts, /[0-9]{2}:[0-9]{2}/)) {
                     hour = substr(ts, RSTART, 5)
+                    # Store hourly data with full timestamp range
+                    if (!(hour in hourly_ok)) {
+                        hourly_ok[hour] = 0
+                        hourly_range[hour "_start"] = ts
+                    }
                     hourly_ok[hour]++
+                    hourly_range[hour "_end"] = ts
                 }
             } else {
-                ip_status[ip] = ip_status[ip] ? ip_status[ip]","status : status
+                # Only store error IPs if not excluded
+                if (exclude != "true" || status != 403) {
+                    ip_status[ip] = ip_status[ip] ? ip_status[ip]","status : status
+                }
             }
             
-            # Extract User-Agent (field 6 when split by ")
+            # Extract User-Agent
             if (match($0, /"[^"]*"$/)) {
                 ua = substr($0, RSTART + 1, RLENGTH - 2)
                 if (ua != "-" && length(ua) > 0) {
@@ -237,14 +258,16 @@ parse_logs() {
             print url_count[u], u > "'$TMP_DIR'/urls.txt"
         }
         
-        # Output Queries - FULL LINE
+        # Output Queries
         for (q in query_count) {
             print query_count[q], q > "'$TMP_DIR'/queries.txt"
         }
         
-        # Output Hourly OK counts
+        # Output Hourly OK counts with range
         for (h in hourly_ok) {
-            print h, hourly_ok[h] > "'$TMP_DIR'/hourly.txt"
+            start_ts = hourly_range[h "_start"]
+            end_ts = hourly_range[h "_end"]
+            print h, hourly_ok[h], start_ts, end_ts > "'$TMP_DIR'/hourly.txt"
         }
         
         # Output Status counts
@@ -267,13 +290,11 @@ get_country_asn() {
     local country="Unknown"
     local asn="Unknown"
     
-    # Try offline GeoIP first
     if command -v geoiplookup >/dev/null 2>&1; then
         country=$(geoiplookup "$ip" 2>/dev/null | head -1 | awk -F': ' '{print $2}' | cut -d',' -f1)
         asn=$(geoiplookup -f /usr/share/GeoIP/GeoIPASNum.dat "$ip" 2>/dev/null | awk -F': ' '{print $2}' | cut -d' ' -f1)
     fi
     
-    # Fallback to online API if offline fails
     if [[ "$country" == "Unknown" || -z "$country" ]]; then
         local api_data=$(curl -s -m 2 "http://ip-api.com/csv/$ip?fields=countryCode,as" 2>/dev/null)
         country=$(echo "$api_data" | cut -d',' -f1)
@@ -284,7 +305,7 @@ get_country_asn() {
 }
 
 # ============================================
-# ANALYSIS FUNCTIONS - TOP 20
+# ANALYSIS FUNCTIONS
 # ============================================
 show_top_ips() {
     local count="${1:-$TOP_COUNT}"
@@ -349,7 +370,6 @@ show_status_breakdown() {
     echo -e "${BLUE}───────────────────────────────────────────────────────────────${NC}"
     
     sort -rn "$TMP_DIR/status.txt" | while read -r status count; do
-        # Color code status
         local color="$NC"
         [[ "$status" -ge 200 && "$status" -lt 300 ]] && color="$GREEN"
         [[ "$status" -ge 300 && "$status" -lt 400 ]] && color="$YELLOW"
@@ -363,11 +383,14 @@ show_hourly_stats() {
     echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}HOURLY 200 OK REQUESTS${NC}"
     echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${CYAN}TIME     COUNT${NC}"
+    echo -e "${CYAN}TIME RANGE                          HITS${NC}"
     echo -e "${BLUE}───────────────────────────────────────────────────────────────${NC}"
     
-    sort "$TMP_DIR/hourly.txt" | while read -r hour count; do
-        printf "%-8s %s\n" "$hour" "$count"
+    sort "$TMP_DIR/hourly.txt" | while read -r hour count start_ts end_ts; do
+        # Format the time range
+        local start_time=$(echo "$start_ts" | sed 's/\[//' | sed 's/\]//')
+        local end_time=$(echo "$end_ts" | sed 's/\[//' | sed 's/\]//')
+        printf "%-30s %s\n" "$start_time → $end_time" "$count"
     done
 }
 
@@ -386,6 +409,11 @@ show_summary() {
     echo -e "Total Errors:    ${RED}$total_err${NC} (${err_pct}%)"
     echo -e "Log Timezone:    ${CYAN}$LOG_TZ${NC}"
     echo -e "User Timezone:   ${CYAN}IST${NC}"
+    if [[ "$EXCLUDE_403" == "true" ]]; then
+        echo -e "403 Excluded:    ${GREEN}YES${NC}"
+    else
+        echo -e "403 Excluded:    ${RED}NO${NC}"
+    fi
 }
 
 # ============================================
@@ -400,10 +428,11 @@ show_analysis_menu() {
     echo -e "3. Top $TOP_COUNT Requested URLs"
     echo -e "4. Top $TOP_COUNT Query Strings"
     echo -e "5. HTTP Status Breakdown"
-    echo -e "6. Hourly 200 OK Stats"
+    echo -e "6. Hourly 200 OK Stats (with time range)"
     echo -e "7. Complete Analysis (All of above)"
     echo -e "8. Summary Only"
-    echo -e "9. Exit to Time Menu"
+    echo -e "9. Toggle 403 Exclude (Current: $([[ "$EXCLUDE_403" == "true" ]] && echo "ON" || echo "OFF"))"
+    echo -e "0. Exit to Time Menu"
     echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
 }
 
@@ -427,7 +456,18 @@ run_analysis() {
             show_hourly_stats
             ;;
         8) show_summary ;;
-        9) return 1 ;;  # Signal to exit to time menu
+        9) 
+            # Toggle 403 exclude
+            if [[ "$EXCLUDE_403" == "true" ]]; then
+                EXCLUDE_403=false
+                echo -e "${YELLOW}403 Exclude turned OFF (403 will be included)${NC}"
+            else
+                EXCLUDE_403=true
+                echo -e "${YELLOW}403 Exclude turned ON (403 will be excluded)${NC}"
+            fi
+            return 2  # Signal to re-parse with new setting
+            ;;
+        0) return 1 ;;  # Exit to time menu
         *) echo -e "${RED}Invalid choice${NC}" ;;
     esac
     return 0
@@ -475,24 +515,23 @@ main() {
     echo -e "${GREEN}✓ Format: $LOG_FORMAT${NC}"
     echo -e "${GREEN}✓ Timezone: $LOG_TZ${NC}"
     
-    # Show first and last entry timestamps with range
+    # Show first and last entry timestamps with IST - FIXED
     local first_entry=$(head -1 "$LOG_FILE" | awk -F'[][]' '{print $2}')
     local last_entry=$(tail -1 "$LOG_FILE" | awk -F'[][]' '{print $2}')
-    local first_ist=$(TZ=Asia/Kolkata date -d "$first_entry" "+%Y-%m-%d %H:%M:%S %Z" 2>/dev/null || echo "N/A")
-    local last_ist=$(TZ=Asia/Kolkata date -d "$last_entry" "+%Y-%m-%d %H:%M:%S %Z" 2>/dev/null || echo "N/A")
+    local first_ist=$(convert_log_to_ist "$first_entry")
+    local last_ist=$(convert_log_to_ist "$last_entry")
     
     echo -e "\n${GREEN}📅 Log Time Range:${NC}"
-    echo -e "  ${CYAN}First Entry:${NC} $first_entry ($LOG_TZ) → $first_ist (IST)"
-    echo -e "  ${CYAN}Last Entry:${NC}  $last_entry ($LOG_TZ) → $last_ist (IST)"
+    echo -e "  ${CYAN}First Entry:${NC} $first_entry ($LOG_TZ) → $first_ist"
+    echo -e "  ${CYAN}Last Entry:${NC}  $last_entry ($LOG_TZ) → $last_ist"
     
-    # Main loop - keeps running until user exits
+    # Main loop
     while true; do
         # Show time menu
         show_time_menu
         read -p "➜ Choose time frame [1-5]: " time_choice
         [[ -z "$time_choice" ]] && time_choice=1
         
-        # Check for exit
         if [[ "$time_choice" == "5" ]]; then
             echo -e "${GREEN}Goodbye!${NC}"
             break
@@ -504,25 +543,35 @@ main() {
         local end_time=$(echo "$range" | cut -d'|' -f2)
         
         echo -e "\n${CYAN}⏳ Processing logs from $start_time to $end_time...${NC}"
+        echo -e "${YELLOW}📌 403 Exclude: $([[ "$EXCLUDE_403" == "true" ]] && echo "ON" || echo "OFF")${NC}"
         
-        # Parse logs (single pass)
-        parse_logs "$start_time" "$end_time" "$LOG_FILE"
+        # Parse logs with current 403 setting
+        parse_logs "$start_time" "$end_time" "$LOG_FILE" "$EXCLUDE_403"
         
         # Show summary
         show_summary
         
-        # Analysis loop - stays in analysis menu until user exits
+        # Analysis loop
         while true; do
             show_analysis_menu
-            read -p "➜ Choose analysis [1-9]: " analysis_choice
+            read -p "➜ Choose analysis [1-9, 0]: " analysis_choice
             [[ -z "$analysis_choice" ]] && analysis_choice=7
             
-            # Run analysis and check if user wants to exit to time menu
-            if ! run_analysis "$analysis_choice"; then
+            # Run analysis and check return code
+            run_analysis "$analysis_choice"
+            local ret=$?
+            
+            if [[ $ret -eq 1 ]]; then
                 break  # Exit to time menu
+            elif [[ $ret -eq 2 ]]; then
+                # Re-parse with new 403 setting
+                echo -e "\n${CYAN}⏳ Re-processing with new 403 setting...${NC}"
+                parse_logs "$start_time" "$end_time" "$LOG_FILE" "$EXCLUDE_403"
+                show_summary
+                continue
             fi
             
-            # Ask to save results
+            # Ask to save
             echo -e "\n${YELLOW}💾 Save results to file? (y/n)${NC}"
             read -p "➜ " save_choice
             if [[ "$save_choice" =~ ^[Yy]$ ]]; then
@@ -531,6 +580,7 @@ main() {
                     echo "DDOS Check Results - $(date)"
                     echo "Log File: $LOG_FILE"
                     echo "Time Range: $start_time to $end_time"
+                    echo "403 Excluded: $EXCLUDE_403"
                     echo "========================================="
                 } > "$output_file"
                 echo -e "${GREEN}✅ Results saved to: $output_file${NC}"
@@ -539,7 +589,7 @@ main() {
             echo -e "\n${YELLOW}🔄 Run another analysis on same time range? (y/n)${NC}"
             read -p "➜ " repeat_analysis
             if [[ ! "$repeat_analysis" =~ ^[Yy]$ ]]; then
-                break  # Exit to time menu
+                break
             fi
         done
     done
