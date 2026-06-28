@@ -1,6 +1,6 @@
 #!/bin/bash
 # DDoS Check Script - Optimized Single-Pass Analysis
-# Version: 1.0
+# Version: 2.0
 
 set -euo pipefail
 
@@ -8,13 +8,14 @@ set -euo pipefail
 # CONFIGURATION
 # ============================================
 SCRIPT_NAME=$(basename "$0")
-VERSION="1.0"
+VERSION="2.0"
 TMP_DIR=""
 LOG_FILE=""
 LOG_FORMAT=""
 LOG_TZ="UTC"
 USER_TZ="IST"
 USER_OFFSET="+0530"
+TOP_COUNT=20  # Changed from 30 to 20
 
 # Colors for output
 RED='\033[0;31m'
@@ -23,6 +24,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
+WHITE='\033[1;37m'
 NC='\033[0m' # No Color
 
 # ============================================
@@ -38,6 +40,10 @@ cleanup() {
 }
 
 die() { echo -e "${RED}ERROR: $*${NC}" >&2; exit 1; }
+
+prompt() {
+    echo -e "${CYAN}▶${NC} $*"
+}
 
 # ============================================
 # DETECTION FUNCTIONS
@@ -118,11 +124,11 @@ get_time_range() {
             end_time=$(date +"[%d/%b/%Y:23:59:59")
             ;;
         4)  # Custom
-            echo -e "${CYAN}Enter start time (format: YYYY-MM-DD HH:MM:SS)${NC}"
+            prompt "Enter start time (format: YYYY-MM-DD HH:MM:SS)"
             echo -e "${YELLOW}Example: 2026-06-28 10:30:00${NC}"
-            read -p "Start: " custom_start
-            echo -e "${CYAN}Enter end time (format: YYYY-MM-DD HH:MM:SS)${NC}"
-            read -p "End: " custom_end
+            read -p "➜ Start: " custom_start
+            prompt "Enter end time (format: YYYY-MM-DD HH:MM:SS)"
+            read -p "➜ End: " custom_end
             start_time=$(date -d "$custom_start" +"[%d/%b/%Y:%H:%M:%S" 2>/dev/null)
             end_time=$(date -d "$custom_end" +"[%d/%b/%Y:%H:%M:%S" 2>/dev/null)
             [[ -z "$start_time" || -z "$end_time" ]] && die "Invalid time format"
@@ -185,11 +191,11 @@ parse_logs() {
                 url = $7
                 url_count[url]++
                 
-                # Extract query string
+                # Extract query string - FULL LINE
                 query = url
                 if (match(url, /\?/)) {
                     query = substr(url, RSTART + 1)
-                    sub(/^[^?]*\?/, "", query)
+                    # Keep the full query string without truncation
                     query_count[query]++
                 } else {
                     query = "(no query)"
@@ -231,7 +237,7 @@ parse_logs() {
             print url_count[u], u > "'$TMP_DIR'/urls.txt"
         }
         
-        # Output Queries
+        # Output Queries - FULL LINE
         for (q in query_count) {
             print query_count[q], q > "'$TMP_DIR'/queries.txt"
         }
@@ -278,10 +284,10 @@ get_country_asn() {
 }
 
 # ============================================
-# ANALYSIS FUNCTIONS
+# ANALYSIS FUNCTIONS - TOP 20
 # ============================================
 show_top_ips() {
-    local count="${1:-30}"
+    local count="${1:-$TOP_COUNT}"
     echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}TOP $count IP ADDRESSES${NC}"
     echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
@@ -297,7 +303,7 @@ show_top_ips() {
 }
 
 show_top_ua() {
-    local count="${1:-30}"
+    local count="${1:-$TOP_COUNT}"
     echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}TOP $count USER AGENTS${NC}"
     echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
@@ -310,7 +316,7 @@ show_top_ua() {
 }
 
 show_top_urls() {
-    local count="${1:-30}"
+    local count="${1:-$TOP_COUNT}"
     echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}TOP $count REQUESTED URLS${NC}"
     echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
@@ -323,7 +329,7 @@ show_top_urls() {
 }
 
 show_top_queries() {
-    local count="${1:-30}"
+    local count="${1:-$TOP_COUNT}"
     echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}TOP $count QUERY STRINGS${NC}"
     echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
@@ -389,15 +395,15 @@ show_analysis_menu() {
     echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}ANALYSIS OPTIONS${NC}"
     echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "1. Top 30 IP Addresses"
-    echo -e "2. Top 30 User Agents"
-    echo -e "3. Top Requested URLs"
-    echo -e "4. Top Query Strings"
+    echo -e "1. Top $TOP_COUNT IP Addresses"
+    echo -e "2. Top $TOP_COUNT User Agents"
+    echo -e "3. Top $TOP_COUNT Requested URLs"
+    echo -e "4. Top $TOP_COUNT Query Strings"
     echo -e "5. HTTP Status Breakdown"
     echo -e "6. Hourly 200 OK Stats"
     echo -e "7. Complete Analysis (All of above)"
     echo -e "8. Summary Only"
-    echo -e "9. Exit"
+    echo -e "9. Exit to Time Menu"
     echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
 }
 
@@ -405,25 +411,26 @@ run_analysis() {
     local choice="$1"
     
     case "$choice" in
-        1) show_top_ips 30 ;;
-        2) show_top_ua 30 ;;
-        3) show_top_urls 30 ;;
-        4) show_top_queries 30 ;;
+        1) show_top_ips $TOP_COUNT ;;
+        2) show_top_ua $TOP_COUNT ;;
+        3) show_top_urls $TOP_COUNT ;;
+        4) show_top_queries $TOP_COUNT ;;
         5) show_status_breakdown ;;
         6) show_hourly_stats ;;
         7)
             show_summary
-            show_top_ips 30
-            show_top_ua 30
-            show_top_urls 30
-            show_top_queries 30
+            show_top_ips $TOP_COUNT
+            show_top_ua $TOP_COUNT
+            show_top_urls $TOP_COUNT
+            show_top_queries $TOP_COUNT
             show_status_breakdown
             show_hourly_stats
             ;;
         8) show_summary ;;
-        9) exit 0 ;;
+        9) return 1 ;;  # Signal to exit to time menu
         *) echo -e "${RED}Invalid choice${NC}" ;;
     esac
+    return 0
 }
 
 # ============================================
@@ -437,6 +444,7 @@ show_time_menu() {
     echo -e "2. Last 30 minutes"
     echo -e "3. Whole day"
     echo -e "4. Custom time range"
+    echo -e "5. Exit script"
     echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
 }
 
@@ -448,9 +456,12 @@ main() {
     setup_temp
     
     # Get log file
-    echo -e "${CYAN}Enter access log file path:${NC}"
+    echo -e "\n${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}DDOS Check Script v$VERSION${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    prompt "Enter access log file path"
     echo -e "${YELLOW}Examples: /var/log/nginx/access.log or /var/log/apache2/*_access_log${NC}"
-    read -r LOG_FILE
+    read -p "➜ Log File: " LOG_FILE
     
     # Expand wildcards if any
     LOG_FILE=$(eval echo "$LOG_FILE" 2>/dev/null)
@@ -460,28 +471,39 @@ main() {
     LOG_FORMAT=$(detect_log_format)
     LOG_TZ=$(detect_log_timezone)
     
-    echo -e "${GREEN}✓ Log file: $LOG_FILE${NC}"
+    echo -e "\n${GREEN}✓ Log file: $LOG_FILE${NC}"
     echo -e "${GREEN}✓ Format: $LOG_FORMAT${NC}"
     echo -e "${GREEN}✓ Timezone: $LOG_TZ${NC}"
     
-    # Show first entry timestamp
+    # Show first and last entry timestamps with range
     local first_entry=$(head -1 "$LOG_FILE" | awk -F'[][]' '{print $2}')
+    local last_entry=$(tail -1 "$LOG_FILE" | awk -F'[][]' '{print $2}')
     local first_ist=$(TZ=Asia/Kolkata date -d "$first_entry" "+%Y-%m-%d %H:%M:%S %Z" 2>/dev/null || echo "N/A")
-    echo -e "${GREEN}✓ First log entry: $first_entry ($LOG_TZ)${NC}"
-    echo -e "${GREEN}✓ In IST: $first_ist${NC}"
+    local last_ist=$(TZ=Asia/Kolkata date -d "$last_entry" "+%Y-%m-%d %H:%M:%S %Z" 2>/dev/null || echo "N/A")
     
+    echo -e "\n${GREEN}📅 Log Time Range:${NC}"
+    echo -e "  ${CYAN}First Entry:${NC} $first_entry ($LOG_TZ) → $first_ist (IST)"
+    echo -e "  ${CYAN}Last Entry:${NC}  $last_entry ($LOG_TZ) → $last_ist (IST)"
+    
+    # Main loop - keeps running until user exits
     while true; do
         # Show time menu
         show_time_menu
-        read -p "Choose time frame [1-4]: " time_choice
+        read -p "➜ Choose time frame [1-5]: " time_choice
         [[ -z "$time_choice" ]] && time_choice=1
+        
+        # Check for exit
+        if [[ "$time_choice" == "5" ]]; then
+            echo -e "${GREEN}Goodbye!${NC}"
+            break
+        fi
         
         # Get time range
         local range=$(get_time_range "$time_choice")
         local start_time=$(echo "$range" | cut -d'|' -f1)
         local end_time=$(echo "$range" | cut -d'|' -f2)
         
-        echo -e "${CYAN}Processing logs from $start_time to $end_time...${NC}"
+        echo -e "\n${CYAN}⏳ Processing logs from $start_time to $end_time...${NC}"
         
         # Parse logs (single pass)
         parse_logs "$start_time" "$end_time" "$LOG_FILE"
@@ -489,40 +511,41 @@ main() {
         # Show summary
         show_summary
         
-        # Analysis menu
+        # Analysis loop - stays in analysis menu until user exits
         while true; do
             show_analysis_menu
-            read -p "Choose analysis [1-9]: " analysis_choice
+            read -p "➜ Choose analysis [1-9]: " analysis_choice
             [[ -z "$analysis_choice" ]] && analysis_choice=7
             
-            run_analysis "$analysis_choice"
+            # Run analysis and check if user wants to exit to time menu
+            if ! run_analysis "$analysis_choice"; then
+                break  # Exit to time menu
+            fi
             
-            # Ask to save
-            echo -e "\n${YELLOW}Save results? (y/n)${NC}"
-            read -r save_choice
+            # Ask to save results
+            echo -e "\n${YELLOW}💾 Save results to file? (y/n)${NC}"
+            read -p "➜ " save_choice
             if [[ "$save_choice" =~ ^[Yy]$ ]]; then
                 local output_file="$HOME/ddos_results_$(date +%Y%m%d_%H%M%S).txt"
                 {
-                    echo "DDoS Check Results - $(date)"
+                    echo "DDOS Check Results - $(date)"
                     echo "Log File: $LOG_FILE"
                     echo "Time Range: $start_time to $end_time"
                     echo "========================================="
-                    # Re-run analysis and capture output
                 } > "$output_file"
-                echo -e "${GREEN}Results saved to: $output_file${NC}"
+                echo -e "${GREEN}✅ Results saved to: $output_file${NC}"
             fi
             
-            echo -e "\n${YELLOW}Run another analysis on same time range? (y/n)${NC}"
-            read -r repeat_analysis
-            [[ ! "$repeat_analysis" =~ ^[Yy]$ ]] && break
+            echo -e "\n${YELLOW}🔄 Run another analysis on same time range? (y/n)${NC}"
+            read -p "➜ " repeat_analysis
+            if [[ ! "$repeat_analysis" =~ ^[Yy]$ ]]; then
+                break  # Exit to time menu
+            fi
         done
-        
-        echo -e "\n${YELLOW}Analyze different time range? (y/n)${NC}"
-        read -r repeat_time
-        [[ ! "$repeat_time" =~ ^[Yy]$ ]] && break
     done
     
-    echo -e "${GREEN}Done!${NC}"
+    echo -e "${GREEN}✅ Done!${NC}"
+    cleanup
 }
 
 # ============================================
