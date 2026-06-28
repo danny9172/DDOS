@@ -1,0 +1,531 @@
+#!/bin/bash
+# DDoS Check Script - Optimized Single-Pass Analysis
+# Version: 1.0
+
+set -euo pipefail
+
+# ============================================
+# CONFIGURATION
+# ============================================
+SCRIPT_NAME=$(basename "$0")
+VERSION="1.0"
+TMP_DIR=""
+LOG_FILE=""
+LOG_FORMAT=""
+LOG_TZ="UTC"
+USER_TZ="IST"
+USER_OFFSET="+0530"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# ============================================
+# SETUP & CLEANUP
+# ============================================
+setup_temp() {
+    TMP_DIR=$(mktemp -d /tmp/ddos.XXXXXX 2>/dev/null || mktemp -d /var/tmp/ddos.XXXXXX)
+    trap 'cleanup' EXIT INT TERM
+}
+
+cleanup() {
+    [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+}
+
+die() { echo -e "${RED}ERROR: $*${NC}" >&2; exit 1; }
+
+# ============================================
+# DETECTION FUNCTIONS
+# ============================================
+detect_log_format() {
+    local first_line=$(head -1 "$LOG_FILE" 2>/dev/null)
+    
+    # Check for Common Log Format: IP - - [timestamp] "method path proto" status size
+    if [[ "$first_line" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+.*\[.*\].*\"[A-Z]+\ .+\ HTTP/[0-9]+\".* ]]; then
+        echo "apache"
+        return
+    fi
+    
+    # Check for Nginx format (similar but may have $http_x_forwarded_for)
+    if [[ "$first_line" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+.*\[.*\].*\"[A-Z]+\ .+\ HTTP/[0-9]+\".*\"-\"\ *\" ]]; then
+        echo "nginx"
+        return
+    fi
+    
+    # Check for combined format
+    if [[ "$first_line" =~ .*\"-\"\ *\".* ]]; then
+        echo "combined"
+        return
+    fi
+    
+    echo "unknown"
+}
+
+detect_log_timezone() {
+    local first_ts=$(head -1 "$LOG_FILE" | awk -F'[][]' '{print $2}' 2>/dev/null)
+    [[ -z "$first_ts" ]] && echo "UTC" && return
+    
+    # Check if timestamp contains timezone offset
+    if [[ "$first_ts" =~ .*[+-][0-9]{4}$ ]]; then
+        echo "UTC"
+    elif [[ "$first_ts" =~ .*IST$ ]]; then
+        echo "IST"
+    else
+        # Default to UTC for Nginx/Apache standard logs
+        echo "UTC"
+    fi
+}
+
+# ============================================
+# TIME HANDLING - SMART IST CONVERSION
+# ============================================
+convert_to_log_tz() {
+    local user_time="$1"
+    local log_tz="$2"
+    
+    if [[ "$log_tz" == "UTC" ]]; then
+        date -d "$user_time UTC" +"[%d/%b/%Y:%H:%M:%S" 2>/dev/null
+    elif [[ "$log_tz" == "IST" ]]; then
+        date -d "$user_time" +"[%d/%b/%Y:%H:%M:%S" 2>/dev/null
+    else
+        # Convert from IST to UTC if log is UTC
+        date -d "$user_time IST" +"[%d/%b/%Y:%H:%M:%S" 2>/dev/null
+    fi
+}
+
+get_time_range() {
+    local choice="$1"
+    local start_time=""
+    local end_time=""
+    local now=$(date +"%Y-%m-%d %H:%M:%S")
+    
+    case "$choice" in
+        1)  # Last 60 min
+            start_time=$(date -d '60 minutes ago' +"[%d/%b/%Y:%H:%M:%S")
+            end_time=$(date +"[%d/%b/%Y:%H:%M:%S")
+            ;;
+        2)  # Last 30 min
+            start_time=$(date -d '30 minutes ago' +"[%d/%b/%Y:%H:%M:%S")
+            end_time=$(date +"[%d/%b/%Y:%H:%M:%S")
+            ;;
+        3)  # Whole day
+            start_time=$(date +"[%d/%b/%Y:00:00:00")
+            end_time=$(date +"[%d/%b/%Y:23:59:59")
+            ;;
+        4)  # Custom
+            echo -e "${CYAN}Enter start time (format: YYYY-MM-DD HH:MM:SS)${NC}"
+            echo -e "${YELLOW}Example: 2026-06-28 10:30:00${NC}"
+            read -p "Start: " custom_start
+            echo -e "${CYAN}Enter end time (format: YYYY-MM-DD HH:MM:SS)${NC}"
+            read -p "End: " custom_end
+            start_time=$(date -d "$custom_start" +"[%d/%b/%Y:%H:%M:%S" 2>/dev/null)
+            end_time=$(date -d "$custom_end" +"[%d/%b/%Y:%H:%M:%S" 2>/dev/null)
+            [[ -z "$start_time" || -z "$end_time" ]] && die "Invalid time format"
+            ;;
+        *) die "Invalid choice" ;;
+    esac
+    
+    echo "$start_time|$end_time"
+}
+
+# ============================================
+# SINGLE-PASS PARSING - OPTIMIZED
+# ============================================
+parse_logs() {
+    local start_time="$1"
+    local end_time="$2"
+    local parse_file="$3"
+    
+    # Single awk pass - extracts ALL data at once
+    awk -v start="$start_time" -v end="$end_time" '
+    BEGIN {
+        # Initialize arrays
+        split("", ip_count)
+        split("", ua_count)
+        split("", url_count)
+        split("", query_count)
+        split("", status_count)
+        split("", hourly_ok)
+        split("", ip_status)
+        
+        total_requests = 0
+        total_ok = 0
+        total_errors = 0
+    }
+    
+    # Parse Apache/Nginx combined format
+    {
+        # Extract timestamp (assuming [dd/MMM/yyyy:HH:MM:SS] format)
+        ts = ""
+        if (match($0, /\[[^]]+\]/)) {
+            ts = substr($0, RSTART, RLENGTH)
+        }
+        
+        # Only process if within time range
+        if (ts >= start && ts <= end) {
+            total_requests++
+            
+            # Extract IP (field 1)
+            ip = $1
+            
+            # Extract status code
+            status = $9
+            status_count[status]++
+            
+            if (status == 200 || status == 304) {
+                total_ok++
+                ip_count[ip]++
+                
+                # Extract URL (field 7)
+                url = $7
+                url_count[url]++
+                
+                # Extract query string
+                query = url
+                if (match(url, /\?/)) {
+                    query = substr(url, RSTART + 1)
+                    sub(/^[^?]*\?/, "", query)
+                    query_count[query]++
+                } else {
+                    query = "(no query)"
+                }
+                
+                # Extract hour for hourly stats
+                hour = ""
+                if (match(ts, /[0-9]{2}:[0-9]{2}/)) {
+                    hour = substr(ts, RSTART, 5)
+                    hourly_ok[hour]++
+                }
+            } else {
+                ip_status[ip] = ip_status[ip] ? ip_status[ip]","status : status
+            }
+            
+            # Extract User-Agent (field 6 when split by ")
+            if (match($0, /"[^"]*"$/)) {
+                ua = substr($0, RSTART + 1, RLENGTH - 2)
+                if (ua != "-" && length(ua) > 0) {
+                    ua_count[ua]++
+                }
+            }
+        }
+    }
+    
+    END {
+        # Output IPs
+        for (i in ip_count) {
+            print ip_count[i], i > "'$TMP_DIR'/ips.txt"
+        }
+        
+        # Output User Agents
+        for (u in ua_count) {
+            print ua_count[u], u > "'$TMP_DIR'/ua.txt"
+        }
+        
+        # Output URLs
+        for (u in url_count) {
+            print url_count[u], u > "'$TMP_DIR'/urls.txt"
+        }
+        
+        # Output Queries
+        for (q in query_count) {
+            print query_count[q], q > "'$TMP_DIR'/queries.txt"
+        }
+        
+        # Output Hourly OK counts
+        for (h in hourly_ok) {
+            print h, hourly_ok[h] > "'$TMP_DIR'/hourly.txt"
+        }
+        
+        # Output Status counts
+        for (s in status_count) {
+            print s, status_count[s] > "'$TMP_DIR'/status.txt"
+        }
+        
+        # Output totals
+        print total_requests > "'$TMP_DIR'/total_requests.txt"
+        print total_ok > "'$TMP_DIR'/total_ok.txt"
+    }
+    ' "$parse_file"
+}
+
+# ============================================
+# GEOIP FUNCTIONS
+# ============================================
+get_country_asn() {
+    local ip="$1"
+    local country="Unknown"
+    local asn="Unknown"
+    
+    # Try offline GeoIP first
+    if command -v geoiplookup >/dev/null 2>&1; then
+        country=$(geoiplookup "$ip" 2>/dev/null | head -1 | awk -F': ' '{print $2}' | cut -d',' -f1)
+        asn=$(geoiplookup -f /usr/share/GeoIP/GeoIPASNum.dat "$ip" 2>/dev/null | awk -F': ' '{print $2}' | cut -d' ' -f1)
+    fi
+    
+    # Fallback to online API if offline fails
+    if [[ "$country" == "Unknown" || -z "$country" ]]; then
+        local api_data=$(curl -s -m 2 "http://ip-api.com/csv/$ip?fields=countryCode,as" 2>/dev/null)
+        country=$(echo "$api_data" | cut -d',' -f1)
+        asn=$(echo "$api_data" | cut -d',' -f2 | cut -d' ' -f1)
+    fi
+    
+    echo "$country|$asn"
+}
+
+# ============================================
+# ANALYSIS FUNCTIONS
+# ============================================
+show_top_ips() {
+    local count="${1:-30}"
+    echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}TOP $count IP ADDRESSES${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}#  HITS  IP ADDRESS         COUNTRY          ASN${NC}"
+    echo -e "${BLUE}───────────────────────────────────────────────────────────────${NC}"
+    
+    sort -rn "$TMP_DIR/ips.txt" | head -"$count" | while read -r hits ip; do
+        local geo=$(get_country_asn "$ip")
+        local country=$(echo "$geo" | cut -d'|' -f1)
+        local asn=$(echo "$geo" | cut -d'|' -f2)
+        printf "%-3s %-6s %-18s %-15s %s\n" "" "$hits" "$ip" "$country" "$asn"
+    done
+}
+
+show_top_ua() {
+    local count="${1:-30}"
+    echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}TOP $count USER AGENTS${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}#  HITS  USER AGENT${NC}"
+    echo -e "${BLUE}───────────────────────────────────────────────────────────────${NC}"
+    
+    sort -rn "$TMP_DIR/ua.txt" | head -"$count" | while read -r hits ua; do
+        printf "%-3s %-6s %s\n" "" "$hits" "$ua"
+    done
+}
+
+show_top_urls() {
+    local count="${1:-30}"
+    echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}TOP $count REQUESTED URLS${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}#  HITS  URL${NC}"
+    echo -e "${BLUE}───────────────────────────────────────────────────────────────${NC}"
+    
+    sort -rn "$TMP_DIR/urls.txt" | head -"$count" | while read -r hits url; do
+        printf "%-3s %-6s %s\n" "" "$hits" "$url"
+    done
+}
+
+show_top_queries() {
+    local count="${1:-30}"
+    echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}TOP $count QUERY STRINGS${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}#  HITS  QUERY STRING${NC}"
+    echo -e "${BLUE}───────────────────────────────────────────────────────────────${NC}"
+    
+    sort -rn "$TMP_DIR/queries.txt" | head -"$count" | while read -r hits query; do
+        printf "%-3s %-6s %s\n" "" "$hits" "$query"
+    done
+}
+
+show_status_breakdown() {
+    echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}HTTP STATUS CODE BREAKDOWN${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}STATUS  COUNT${NC}"
+    echo -e "${BLUE}───────────────────────────────────────────────────────────────${NC}"
+    
+    sort -rn "$TMP_DIR/status.txt" | while read -r status count; do
+        # Color code status
+        local color="$NC"
+        [[ "$status" -ge 200 && "$status" -lt 300 ]] && color="$GREEN"
+        [[ "$status" -ge 300 && "$status" -lt 400 ]] && color="$YELLOW"
+        [[ "$status" -ge 400 && "$status" -lt 500 ]] && color="$PURPLE"
+        [[ "$status" -ge 500 ]] && color="$RED"
+        echo -e "${color}$status${NC}  $count"
+    done
+}
+
+show_hourly_stats() {
+    echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}HOURLY 200 OK REQUESTS${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}TIME     COUNT${NC}"
+    echo -e "${BLUE}───────────────────────────────────────────────────────────────${NC}"
+    
+    sort "$TMP_DIR/hourly.txt" | while read -r hour count; do
+        printf "%-8s %s\n" "$hour" "$count"
+    done
+}
+
+show_summary() {
+    local total_req=$(cat "$TMP_DIR/total_requests.txt" 2>/dev/null || echo "0")
+    local total_ok=$(cat "$TMP_DIR/total_ok.txt" 2>/dev/null || echo "0")
+    local total_err=$((total_req - total_ok))
+    local err_pct=0
+    [[ "$total_req" -gt 0 ]] && err_pct=$((total_err * 100 / total_req))
+    
+    echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}SUMMARY${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "Total Requests:  ${YELLOW}$total_req${NC}"
+    echo -e "Total 200 OK:    ${GREEN}$total_ok${NC}"
+    echo -e "Total Errors:    ${RED}$total_err${NC} (${err_pct}%)"
+    echo -e "Log Timezone:    ${CYAN}$LOG_TZ${NC}"
+    echo -e "User Timezone:   ${CYAN}IST${NC}"
+}
+
+# ============================================
+# MENU SYSTEM
+# ============================================
+show_analysis_menu() {
+    echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}ANALYSIS OPTIONS${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "1. Top 30 IP Addresses"
+    echo -e "2. Top 30 User Agents"
+    echo -e "3. Top Requested URLs"
+    echo -e "4. Top Query Strings"
+    echo -e "5. HTTP Status Breakdown"
+    echo -e "6. Hourly 200 OK Stats"
+    echo -e "7. Complete Analysis (All of above)"
+    echo -e "8. Summary Only"
+    echo -e "9. Exit"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+}
+
+run_analysis() {
+    local choice="$1"
+    
+    case "$choice" in
+        1) show_top_ips 30 ;;
+        2) show_top_ua 30 ;;
+        3) show_top_urls 30 ;;
+        4) show_top_queries 30 ;;
+        5) show_status_breakdown ;;
+        6) show_hourly_stats ;;
+        7)
+            show_summary
+            show_top_ips 30
+            show_top_ua 30
+            show_top_urls 30
+            show_top_queries 30
+            show_status_breakdown
+            show_hourly_stats
+            ;;
+        8) show_summary ;;
+        9) exit 0 ;;
+        *) echo -e "${RED}Invalid choice${NC}" ;;
+    esac
+}
+
+# ============================================
+# TIME MENU
+# ============================================
+show_time_menu() {
+    echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}SELECT TIME FRAME${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "1. Last 60 minutes (default)"
+    echo -e "2. Last 30 minutes"
+    echo -e "3. Whole day"
+    echo -e "4. Custom time range"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+}
+
+# ============================================
+# MAIN EXECUTION
+# ============================================
+main() {
+    # Setup
+    setup_temp
+    
+    # Get log file
+    echo -e "${CYAN}Enter access log file path:${NC}"
+    echo -e "${YELLOW}Examples: /var/log/nginx/access.log or /var/log/apache2/*_access_log${NC}"
+    read -r LOG_FILE
+    
+    # Expand wildcards if any
+    LOG_FILE=$(eval echo "$LOG_FILE" 2>/dev/null)
+    [[ ! -f "$LOG_FILE" ]] && die "Log file not found: $LOG_FILE"
+    
+    # Detect format and timezone
+    LOG_FORMAT=$(detect_log_format)
+    LOG_TZ=$(detect_log_timezone)
+    
+    echo -e "${GREEN}✓ Log file: $LOG_FILE${NC}"
+    echo -e "${GREEN}✓ Format: $LOG_FORMAT${NC}"
+    echo -e "${GREEN}✓ Timezone: $LOG_TZ${NC}"
+    
+    # Show first entry timestamp
+    local first_entry=$(head -1 "$LOG_FILE" | awk -F'[][]' '{print $2}')
+    local first_ist=$(TZ=Asia/Kolkata date -d "$first_entry" "+%Y-%m-%d %H:%M:%S %Z" 2>/dev/null || echo "N/A")
+    echo -e "${GREEN}✓ First log entry: $first_entry ($LOG_TZ)${NC}"
+    echo -e "${GREEN}✓ In IST: $first_ist${NC}"
+    
+    while true; do
+        # Show time menu
+        show_time_menu
+        read -p "Choose time frame [1-4]: " time_choice
+        [[ -z "$time_choice" ]] && time_choice=1
+        
+        # Get time range
+        local range=$(get_time_range "$time_choice")
+        local start_time=$(echo "$range" | cut -d'|' -f1)
+        local end_time=$(echo "$range" | cut -d'|' -f2)
+        
+        echo -e "${CYAN}Processing logs from $start_time to $end_time...${NC}"
+        
+        # Parse logs (single pass)
+        parse_logs "$start_time" "$end_time" "$LOG_FILE"
+        
+        # Show summary
+        show_summary
+        
+        # Analysis menu
+        while true; do
+            show_analysis_menu
+            read -p "Choose analysis [1-9]: " analysis_choice
+            [[ -z "$analysis_choice" ]] && analysis_choice=7
+            
+            run_analysis "$analysis_choice"
+            
+            # Ask to save
+            echo -e "\n${YELLOW}Save results? (y/n)${NC}"
+            read -r save_choice
+            if [[ "$save_choice" =~ ^[Yy]$ ]]; then
+                local output_file="$HOME/ddos_results_$(date +%Y%m%d_%H%M%S).txt"
+                {
+                    echo "DDoS Check Results - $(date)"
+                    echo "Log File: $LOG_FILE"
+                    echo "Time Range: $start_time to $end_time"
+                    echo "========================================="
+                    # Re-run analysis and capture output
+                } > "$output_file"
+                echo -e "${GREEN}Results saved to: $output_file${NC}"
+            fi
+            
+            echo -e "\n${YELLOW}Run another analysis on same time range? (y/n)${NC}"
+            read -r repeat_analysis
+            [[ ! "$repeat_analysis" =~ ^[Yy]$ ]] && break
+        done
+        
+        echo -e "\n${YELLOW}Analyze different time range? (y/n)${NC}"
+        read -r repeat_time
+        [[ ! "$repeat_time" =~ ^[Yy]$ ]] && break
+    done
+    
+    echo -e "${GREEN}Done!${NC}"
+}
+
+# ============================================
+# START
+# ============================================
+[[ "${BASH_SOURCE[0]}" == "$0" ]] && main "$@"
